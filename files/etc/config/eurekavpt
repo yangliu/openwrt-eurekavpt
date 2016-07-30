@@ -1,0 +1,40 @@
+
+config eurekavpt
+	option backend 'ssledge'
+	option enabled '0'
+
+config ssledge
+	option username ''
+	option password ''
+	list serverhttps ''
+	option haproxy_maxconn '3000'
+	option enabled '0'
+	option haproxy_nbproc '1'
+	option servercipher 'AES128'
+	list serversocks ''
+
+config shadowsocks
+	option enabled '0'
+
+config bypassmode
+	option mode 'isp'
+	option hijacklandns '0'
+	option gfwlist '1'
+	list whitelist_ip ''
+	list blacklist_ip ''
+	list whitelist_domain ''
+	list blacklist_domain ''
+	option ingfw_dns 'isp'
+	option ingfw_dns_port '53'
+	option d2s_local_ip '127.0.0.1'
+	option d2s_local_port '1052'
+	option remote_dns '8.8.8.8'
+	option remote_dns_port '53'
+	option blacklist '0'
+	option blackip '0'
+	option cdn '0'
+	option whitelist '0'
+	option chnroute '0'
+	option whiteip '0'
+	option d2s_proxy_type 'http'
+

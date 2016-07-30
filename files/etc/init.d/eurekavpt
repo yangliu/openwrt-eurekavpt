@@ -1,0 +1,576 @@
+#!/bin/sh /etc/rc.common
+START=99
+
+SERVICE_USE_PID=1
+SERVICE_WRITE_PID=1
+SERVICE_DAEMONIZE=1
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+FILE_DIR='/etc/eurekavpt'
+DNSMASQ_DIR='/etc/dnsmasq.d'
+FILE_CHNROUTE="$FILE_DIR/chnroute.txt"
+FILE_GFWLIST="$FILE_DIR/gfwlist.conf"
+FILE_GFWLIST_DNSMASQ="$DNSMASQ_DIR/gfwlist.conf"
+FILE_CDN="$FILE_DIR/cdn.txt"
+FILE_CDN_DNSMASQ="$DNSMASQ_DIR/cdn.conf"
+GFWLIST_OLD_DNS='127.0.0.1#7913'
+
+CUSTOM_CHAIN='ANTIGFW'
+NAT_PREROUTING_CHAIN='zone_lan_prerouting'
+
+HTTP_PROXY_PORT='12345' # same as redsock's port
+
+HAPROXY_MAXCONN='3000'
+HAPROXY_NBPROC='1'
+HAPROXY_HTTP_PORT='81'
+HAPROXY_SOCKS_PORT='82'
+HAPROXY_STAT_USER='openwrt'
+HAPROXY_STAT_PASS='password'
+SSLEDGE_CIPHER='AES128'
+#SSLEDGE_CIPHER='ECDHE-RSA-CHACHA20-POLY1305'
+
+#=========================
+
+vpt_backend=''
+proxies=''
+ssledge_https_proxy=''
+ssledge_socks_proxy=''
+proxy_ips=''
+black_ips=''
+white_ips=''
+blacklist_domains=''
+whitelist_domains=''
+ssledge_username=''
+ssledge_password=''
+ssledge_authentication=''
+ssledge_enabled=0
+
+ENABLE_GFWLIST=1
+ENABLE_BLACKLIST=1
+ENABLE_WHITELIST=1
+ENABLE_CDN=1
+ENABLE_CHNROUTE=1
+ENABLE_BLACKIP=1
+ENABLE_WHITEIP=1
+
+DEFAULT_MODE='DIRECT'
+#DEFAULT_MODE='PROXY'
+
+HIJACK_LAN_DNS=1
+
+OVERSEA_DNS_IP='8.8.8.8'
+OVERSEA_DNS_PORT='53'
+GFWDNS_IP='127.0.0.1'
+GFWDNS_PORT='1052'
+GFWDNS_TYPE='http'
+
+INGFW_DNS='isp'
+INGFW_DNS_PORT=53
+
+
+network_get_ipaddr WAN_IP wan
+network_get_ipaddr LAN_IP lan
+network_get_dnsserver WAN_DNS wan
+
+
+find_ip() {
+  /usr/bin/nslookup $1|sed 's/[^0-9. ]//g'|tail -n 1|awk -F " " '{print $2}'
+}
+
+process_eurekavpt() {
+  local section="$1"
+  local _buffer
+  local _value
+  config_get _value "$section" enabled
+  if [ "$_value" == '0' ]; then
+    echo $(date): EurekaVPT is not enabled.
+    exit
+  fi
+
+  config_get _value "$section" backend
+  vpt_backend="$_value"
+  config_foreach start_backend $_value
+  config_foreach setup_bypass bypassmode
+  ipt_clear
+  ipt_setup
+}
+
+start_backend() {
+  local section="$1"
+  local _buffer
+  local _value
+  local _p
+  local _domain
+  local _ip
+  echo $(date): [Backend] Start setting up backend...
+  if [ "$vpt_backend" == "ssledge" ]; then
+    echo $(date): [Backend] Backend is SSLedge.
+
+    config_get ssledge_enabled "$section" enabled '0'
+    if [ "$ssledge_enabled" == '0' ]; then
+      echo $(date): [Backend] SSLedge is not enabled.
+      return
+    fi
+
+    config_get ssledge_username "$section" username ''
+    config_get ssledge_password "$section" password ''
+    ssledge_authentication=$(echo -n "$ssledge_username:$ssledge_password" | base64 -w0)
+
+    echo $(date): [Backend] Authentication: $ssledge_authentication
+
+    config_get ssledge_https_proxy "$section" serverhttps
+    config_get ssledge_socks_proxy "$section" serversocks
+    proxies="$ssledge_https_proxy $ssledge_socks_proxy"
+    for _p in $proxies; do
+      _domain=$(echo $_p | cut -d':' -f1)
+      _ip=$(find_ip $_domain)
+      echo $(date): [Backend] Found proxy: $_domain "($_ip)"
+      proxy_ips="$proxy_ips $_ip"
+    done
+
+    config_get HAPROXY_MAXCONN "$section" haproxy_maxconn
+    config_get HAPROXY_NBPROC "$section" haproxy_nbproc
+    config_get SSLEDGE_CIPHER "$section" servercipher
+
+    start_haproxy
+    start_redsocks
+
+  fi
+  echo $(date): [Backend] Done.
+}
+
+setup_bypass(){
+  local section="$1"
+  local _buffer
+  local _value
+  local _restart_dnsmasq=0
+
+  echo $(date): [BYPASS] Start setup DNS and iptables...
+
+  [ -f "$DNSMASQ_DIR" ] || mkdir -p "$DNSMASQ_DIR"
+
+  config_get DEFAULT_MODE "$section" mode 'isp'
+  echo $(date): [BYPASS] DEFAULT_MODE = $DEFAULT_MODE
+
+  config_get HIJACK_LAN_DNS "$section" hijacklandns '1'
+  echo $(date): [BYPASS] HIJACK_LAN_DNS = $HIJACK_LAN_DNS
+
+  config_get INGFW_DNS "$section" ingfw_dns 'isp'
+  if [ "$INGFW_DNS" == 'isp' ]; then
+    INGFW_DNS=$(echo $WAN_DNS | cut -d' ' -f1)
+  fi
+  config_get INGFW_DNS_PORT "$section" ingfw_dns_port '53'
+  echo $(date): [BYPASS] INGFW_DNS:PORT: $INGFW_DNS:$INGFW_DNS_PORT
+
+  config_get GFWDNS_IP "$section" d2s_local_ip '127.0.0.1'
+  config_get GFWDNS_PORT "$section" d2s_local_port '1052'
+  config_get GFWDNS_TYPE "$section" d2s_proxy_type 'http'
+  echo $(date): [BYPASS] GFWDNS_IP:PORT: $GFWDNS_IP:$GFWDNS_PORT "($GFWDNS_TYPE)"
+
+  config_get OVERSEA_DNS_IP "$section" remote_dns '8.8.8.8'
+  config_get OVERSEA_DNS_PORT "$section" remote_dns_port '53'
+  #config_get OVERSEA_DNS_TYPE "$section" remote_dns_type 'tcp'
+  echo $(date): [BYPASS] OVERSEA_DNS:PORT: $OVERSEA_DNS_IP:$OVERSEA_DNS_PORT
+
+  config_get ENABLE_GFWLIST "$section" gfwlist '1'
+  # remove old gfwlist.conf
+  rm -rf "$FILE_GFWLIST_DNSMASQ" > /dev/null 2>&1
+  if [ -f "$FILE_GFWLIST" ]; then
+    cp "$FILE_GFWLIST" /tmp/gfwlist.conf
+    sed -i "s/$GFWLIST_OLD_DNS/$GFWDNS_IP#$GFWDNS_PORT/g" /tmp/gfwlist.conf
+    mv /tmp/gfwlist.conf "$FILE_GFWLIST_DNSMASQ"
+    _restart_dnsmasq=1
+  else
+    ENABLE_GFWLIST='0'
+  fi
+  echo $(date): [BYPASS] ENABLE_GFWLIST = $ENABLE_GFWLIST ";" gfwlist: $FILE_GFWLIST / $FILE_CDN_DNSMASQ
+
+  config_get ENABLE_CHNROUTE "$section" chnroute '1'
+  echo $(date): [BYPASS] ENABLE_CHNROUTE = $ENABLE_CHNROUTE
+
+  config_get ENABLE_CDN "$section" cdn '0'
+  # remove old cdn.conf
+  rm -rf "$FILE_CDN_DNSMASQ" > /dev/null 2>&1
+  if [ "$ENABLE_CDN" == '1' ] && [ -f "$FILE_CDN" ]; then
+    [ -f /tmp/cdn.conf ] && rm /tmp/cdn.conf
+    touch /tmp/cdn.conf
+    cat $FILE_CDN | sed "s/^/server=&\/./g" | sed "s/$/\/&$INGFW_DNS#$INGFW_DNS_PORT/g" | sort | awk '{if ($0!=line) print;line=$0}' >> /tmp/cdn.conf
+    mv /tmp/cdn.conf $FILE_CDN_DNSMASQ
+    _restart_dnsmasq='1'
+  else
+    ENABLE_CDN='0'
+  fi
+  echo $(date): [BYPASS] ENABLE_CDN = $ENABLE_CDN ";" cdn: $FILE_CDN / $FILE_CDN_DNSMASQ
+  
+  config_get ENABLE_BLACKLIST "$section" blacklist '0'
+  config_get ENABLE_BLACKIP "$section" blackip '0'
+  config_get ENABLE_WHITELIST "$section" whitelist '0'
+  config_get ENABLE_WHITEIP "$section" whiteip '0'
+  config_get black_ips "$section" blacklist_ip ''
+  config_get white_ips "$section" whitelist_ip ''
+  echo $(date): [BYPASS] ENABLE_BLACKIP = $ENABLE_BLACKIP";" black_ips: $black_ips
+  echo $(date): [BYPASS] ENABLE_WHITEIP = $ENABLE_WHITEIP";" white_ips: $white_ips
+
+  config_get blacklist_domains "$section" blacklist_domain ''
+  # remove old vpt_blacklist.conf
+  rm -rf "$DNSMASQ_DIR/vpt_blacklist.conf" > /dev/null 2>&1
+  [ -z "$blacklist_domains" ] && ENABLE_BLACKLIST='0'
+  if [ "$ENABLE_BLACKLIST" == '1' ]; then
+    local _domain
+
+    [ -f /tmp/vpt_blacklist.conf ] && rm -f /tmp/vpt_blacklist.conf
+    touch /tmp/vpt_blacklist.conf
+    
+    for _domain in $blacklist_domains; do
+      echo "server=/.$_domain/$GFWDNS_IP#$GFWDNS_PORT" >> /tmp/vpt_blacklist.conf
+      echo "ipset=/.$_domain/blacklist" >> /tmp/vpt_blacklist.conf
+    done
+    mv /tmp/vpt_blacklist.conf "$DNSMASQ_DIR/vpt_blacklist.conf"
+    _restart_dnsmasq='1'
+  fi
+  echo $(date): [BYPASS] ENABLE_BLACKLIST = $ENABLE_BLACKLIST";" blacklist_domains: $blacklist_domains
+ 
+  config_get whitelist_domains "$section" whitelist_domain ''
+  # remove old vpt_whitelist.conf
+  rm -rf "$DNSMASQ_DIR/vpt_whitelist.conf" > /dev/null 2>&1
+  [ -z "$whitelist_domains" ] && ENABLE_WHITELIST='0'
+  if [ "$ENABLE_WHITELIST" == '1' ]; then
+    local _domain
+
+    [ -f /tmp/vpt_whitelist.conf ] && rm -f /tmp/vpt_whitelist.conf
+    touch /tmp/vpt_whitelist.conf
+    
+    for _domain in $whitelist_domains; do
+      echo "server=/.$_domain/$INGFW_DNS#$INGFW_DNS_PORT" >> /tmp/vpt_whitelist.conf
+      echo "ipset=/.$_domain/whitelist" >> /tmp/vpt_whitelist.conf
+    done
+    mv /tmp/vpt_whitelist.conf "$DNSMASQ_DIR/vpt_whitelist.conf"
+    _restart_dnsmasq='1'
+  fi
+  echo $(date): [BYPASS] ENABLE_WHITELIST = $ENABLE_WHITELIST";" whitelist_domains: $whitelist_domains
+
+  start_dns2socks
+
+  if [ "$_restart_dnsmasq" == '1' ]; then
+    /etc/init.d/dnsmasq restart
+  fi
+
+}
+
+ipt_clear() {
+  echo -n $(date): [IPT Clear] Clear iptables and ipsets ...
+  # remove POSTROUTING and OUTPUT
+  iptables -t nat -D $NAT_PREROUTING_CHAIN -p tcp -j $CUSTOM_CHAIN > /dev/null 2>&1
+  iptables -t nat -D $NAT_PREROUTING_CHAIN -s $LAN_IP/24 -p udp --dport 53 -j DNAT --to $LAN_IP >/dev/null 2>&1
+  #iptables -t nat -D OUTPUT -p tcp -j $CUSTOM_CHAIN
+
+  # remove $CUSTOM_CHAIN chain if existed
+  iptables -t nat -F $CUSTOM_CHAIN > /dev/null 2>&1
+  iptables -t nat -X $CUSTOM_CHAIN > /dev/null 2>&1
+
+  # clear IPSET
+
+  ipset -F gfwlist > /dev/null 2>&1
+  ipset -X gfwlist > /dev/null 2>&1
+
+  ipset -F blacklist > /dev/null 2>&1
+  ipset -X blacklist > /dev/null 2>&1
+
+  ipset -F whitelist > /dev/null 2>&1
+  ipset -X whitelist > /dev/null 2>&1
+
+  ipset -F chnroute > /dev/null 2>&1
+  ipset -X chnroute > /dev/null 2>&1
+
+  ipset -F blackip > /dev/null 2>&1
+  ipset -X blackip > /dev/null 2>&1
+
+  ipset -F whiteip > /dev/null 2>&1
+  ipset -X whiteip > /dev/null 2>&1
+  echo done.
+}
+
+ipt_setup() {
+  if [ ! -f $FILE_CHNROUTE ]; then
+    ENABLE_CHNROUTE=0
+    echo $(date): [IPT] Cannot find $FILE_CHNROUTE, set ENABLE_CHNROUTE=$ENABLE_CHNROUTE.
+  fi
+  if [ ! -f $FILE_CDN ]; then
+    ENABLE_CDN=0
+    echo $(date): [IPT] Cannot find $FILE_CDN, set ENABLE_CDN=$ENABLE_CDN.
+  fi
+  if [ ! -f $FILE_GFWLIST ]; then
+    ENABLE_GFWLIST=0
+    echo $(date): [IPT] Cannot find $FILE_GFWLIST, set ENABLE_GFWLIST=$ENABLE_GFWLIST.
+  fi
+
+
+  # create $CUSTOM_CHAIN chain
+  iptables -t nat -N $CUSTOM_CHAIN
+  echo $(date): [IPT] Custom chain $CUSTOM_CHAIN is created.
+
+  # ignore the proxy server ip
+  echo -n $(date): [IPT] Bypass proxy servers:
+  for proxy_ip in $proxy_ips; do
+    iptables -t nat -A $CUSTOM_CHAIN -d $proxy_ip -j RETURN
+    echo -n " $proxy_ip"
+  done
+  echo " done."
+
+  echo $(date): [IPT] Bypass LAN IPs...
+  # ignore local networks
+  iptables -t nat -A $CUSTOM_CHAIN -d 0.0.0.0/8 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 10.0.0.0/8 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 127.0.0.0/8 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 169.254.0.0/16 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 172.16.0.0/12 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 192.168.0.0/16 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 224.0.0.0/4 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 240.0.0.0/4 -j RETURN
+
+  echo $(date): [IPT] Bypass Common CHN Public DNS
+  # ignore 114DNS, aliDNS, sDNS, baiduDNS, DNSPOD DNS
+  iptables -t nat -A $CUSTOM_CHAIN -d 114.114.114.114 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 114.114.115.115 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 223.5.5.5 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 223.6.6.6 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 1.2.4.8 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 210.2.4.8 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 180.76.76.76 -j RETURN
+  iptables -t nat -A $CUSTOM_CHAIN -d 119.29.29.29 -j RETURN
+
+  echo -n $(date): [IPT] Bypass WAN DNS: 
+  for dns_ip in $WAN_DNS; do
+    iptables -t nat -A $CUSTOM_CHAIN -d $dns_ip -j RETURN
+    echo -n $dns_ip " "
+  done
+  echo 
+
+
+  # ignore white ip
+  if [ "$ENABLE_WHITEIP" == "1" ] && [ ! -z "$white_ips" ]; then
+    local _ip
+    ipset create whiteip hash:net --hashsize 81920
+    for _ip in $white_ips; do
+      ipset add whiteip "$_ip"
+    done
+    iptables -t nat -A $CUSTOM_CHAIN -p tcp -m set --match-set whiteip dst -j RETURN
+    echo $(date): [IPT] Bypass whitelisted IPs.
+  fi
+
+  # ignore CHNROUTE
+  if [ "$ENABLE_CHNROUTE" == "1" ]; then
+    sed -e "s/^/-A chnroute &/g" -e "1 i\-N chnroute hash:net --hashsize 81920" $FILE_CHNROUTE | awk '{print $0} END{print "COMMIT"}' | ipset -R
+    iptables -t nat -A $CUSTOM_CHAIN -p tcp -m set --match-set chnroute dst -j RETURN
+    echo $(date): [IPT] Bypass CHNRoute
+  fi
+
+  # ignore white list
+  if [ "$ENABLE_WHITELIST" == '1' ]; then
+    ipset create whitelist hash:ip
+    iptables -t nat -A $CUSTOM_CHAIN -p tcp -m set --match-set whitelist dst -j RETURN
+    echo $(date): [IPT] Bypass Whitelisted Domains
+  fi
+
+  # forward black ip to proxy
+  if [ "$ENABLE_BLACKIP" == "1" ] && [ ! -z "$black_ips" ]; then
+    local _ip
+    ipset create blackip hash:net --hashsize 81920
+    for _ip in $black_ips; do
+      ipset add blackip "$_ip"
+    done
+    iptables -t nat -A $CUSTOM_CHAIN -p tcp -m set --match-set blackip dst -j REDIRECT --to-ports $HTTP_PROXY_PORT
+    echo $(date): [IPT] Forward blacklisted IPs
+  fi
+
+  # forward blacklist to proxy
+  if [ "$ENABLE_BLACKLIST" == '1' ]; then
+    ipset create blacklist hash:ip
+    iptables -t nat -A $CUSTOM_CHAIN -p tcp -m set --match-set blacklist dst -j REDIRECT --to-ports $HTTP_PROXY_PORT
+    echo $(date): [IPT] Forward blacklisted domains
+  fi
+  # forward gfwlist to proxy
+  if [ "$ENABLE_GFWLIST" == '1' ]; then
+    ipset create gfwlist hash:ip
+    iptables -t nat -A $CUSTOM_CHAIN -p tcp -m set --match-set gfwlist dst -j REDIRECT --to-ports $HTTP_PROXY_PORT
+    echo $(date): [IPT] Forward GFWlist
+  fi
+
+  if [ $DEFAULT_MODE == 'proxy' ]; then
+    iptables -t nat -A $CUSTOM_CHAIN -p tcp -j REDIRECT --to-ports $HTTP_PROXY_PORT
+    echo $(date): [IPT] Forward all unmatched traffic to proxy...
+  fi
+
+  iptables -t nat -A $NAT_PREROUTING_CHAIN -p tcp -j $CUSTOM_CHAIN
+  echo $(date): [IPT] Add $CUSTOM_CHAIN to $NAT_PREROUTING_CHAIN
+
+  if [ "$HIJACK_LAN_DNS" == '1' ]; then
+    iptables -t nat -A $NAT_PREROUTING_CHAIN -s $LAN_IP/24 -p udp --dport 53 -j DNAT --to $LAN_IP >/dev/null 2>&1
+    echo $(date): [IPT] Forward all DNS requests to $LAN_IP
+  fi
+
+  
+}
+
+stop_haproxy() {
+  echo -n $(date): [HAPROXY] Stop current HAProxy instances...
+  /etc/init.d/haproxy stop > /dev/null 2>&1
+  echo done.
+}
+
+start_haproxy() {
+  stop_haproxy
+
+  echo $(date): [HAPROXY] Generate HAProxy Configration.
+  local _s
+  local _i
+
+  cat > /tmp/haproxy.cfg <<EOL
+global
+  maxconn $HAPROXY_MAXCONN
+  ulimit-n 65535
+  uid 0
+  gid 0
+  daemon
+  nosplice
+  nbproc $HAPROXY_NBPROC
+
+defaults
+  option tcp-smart-accept
+	option tcp-smart-connect
+	option tcpka
+	retries	2
+	option redispatch
+	timeout check 4500
+	timeout connect 10s
+	timeout server 50s
+	timeout client 50s
+	timeout tunnel 1h
+
+listen http_proxy
+  bind :$HAPROXY_HTTP_PORT
+  mode http
+  option http-no-delay
+	option http-keep-alive
+  reqadd Proxy-Authorization:\\ Basic\\ $ssledge_authentication
+  default_backend ssledge_https_pool
+  stats enable
+  stats uri /stats
+  stats realm HA_Stats
+  stats auth $HAPROXY_STAT_USER:$HAPROXY_STAT_PASS
+
+listen socks_proxy
+  bind :$HAPROXY_SOCKS_PORT
+  mode tcp
+  default_backend ssledge_socks_pool
+
+backend ssledge_https_pool
+  mode http
+  balance hdr(User-Agent)
+  option httpchk GET /
+  http-check expect status 400
+EOL
+  _i=1
+  for _s in $ssledge_https_proxy; do
+    echo "  server s$_i $_s check inter 5s ssl ciphers $SSLEDGE_CIPHER force-tlsv12 verify none" >> /tmp/haproxy.cfg
+    _i=$((_i+1))
+  done
+  cat >> /tmp/haproxy.cfg <<EOL
+
+backend ssledge_socks_pool
+  mode tcp
+  balance roundrobin
+EOL
+  _i=1
+  for _s in $ssledge_socks_proxy; do
+    echo -n "  server s$_i $_s check inter 5s ssl ciphers $SSLEDGE_CIPHER force-tlsv12 verify none" >> /tmp/haproxy.cfg
+    if [ "$_i" == 1 ]; then
+      echo >> /tmp/haproxy.cfg
+    else
+      echo ' backup' >> /tmp/haproxy.cfg
+    fi
+    _i=$((_i+1))
+  done
+  mv /tmp/haproxy.cfg /etc/haproxy.cfg
+
+
+  echo -n $(date): [HAPROXY] Start HAProxy ...
+  /etc/init.d/haproxy start
+  echo done.
+}
+
+stop_redsocks() {
+  echo -n $(date): [REDSOCKS] Stop current RedSocks instances...
+  /etc/init.d/redsocks stop > /dev/null 2>&1
+  echo done.  
+}
+
+start_redsocks() {
+  stop_redsocks
+  echo $(date): [REDSOCKS] Generate RedSocks Configration.
+  cat > /etc/redsocks.cfg <<EOL
+base {
+	log_debug = off;
+	log_info = off;
+	log = "file:/dev/null";
+	daemon = on;
+	redirector = iptables;
+}
+
+redsocks {
+	local_ip = 0.0.0.0;
+	local_port = $HTTP_PROXY_PORT;
+	ip = 127.0.0.1;
+	port = $HAPROXY_HTTP_PORT;
+	type = http-connect;
+}
+
+EOL
+
+  echo -n $(date): [REDSOCKS] Start RedSocks ...
+  /etc/init.d/redsocks start
+  echo done.  
+  
+}
+
+stop_dns2socks() {
+  echo -n $(date): [DNS2SOCKS] Stop DNS2SOCKS...
+  service_stop /usr/bin/dns2socks
+  echo done.
+}
+
+start_dns2socks() {
+  stop_dns2socks
+  local extparam=''
+  local server_port=$HAPROXY_SOCKS_PORT
+  if [ "$GFWDNS_TYPE" == 'http' ]; then
+    extparam="$extparam /t"
+    server_port=$HAPROXY_HTTP_PORT
+  fi
+  echo $(date): [DNS2SOCKS] Start DNS2SOCKS...
+  service_start /usr/bin/dns2socks $extparam 127.0.0.1:$server_port $OVERSEA_DNS_IP:$OVERSEA_DNS_PORT $GFWDNS_IP:$GFWDNS_PORT
+  echo service_start /usr/bin/dns2socks $extparam 127.0.0.1:$server_port $OVERSEA_DNS_IP:$OVERSEA_DNS_PORT $GFWDNS_IP:$GFWDNS_PORT
+}
+
+start() {
+  config_load eurekavpt
+  config_foreach process_eurekavpt eurekavpt
+}
+
+stop() {
+  ipt_clear
+  stop_haproxy
+  stop_redsocks
+  stop_dns2socks
+
+  echo -n $(date): [EurekaVPT] Remove custom DNSMASQ settings...
+  rm -rf "$DNSMASQ_DIR/vpt_blacklist.conf" > /dev/null 2>&1
+  rm -rf "$DNSMASQ_DIR/vpt_whitelist.conf" > /dev/null 2>&1
+  rm -rf "$FILE_CDN_DNSMASQ" > /dev/null 2>&1
+  rm -rf "$FILE_GFWLIST_DNSMASQ" > /dev/null 2>&1
+  /etc/init.d/dnsmasq restart
+  echo done.
+
+}
